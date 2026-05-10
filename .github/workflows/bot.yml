@@ -4,13 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: '*/6 * * * *'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v4
@@ -26,4 +24,4 @@ jobs:
       - name: Botni ishga tushirish
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: timeout 300 python bot.py || true
+        run: python bot.py
