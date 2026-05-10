@@ -5,6 +5,9 @@ from PIL import Image
 import img2pdf
 from io import BytesIO
 from datetime import datetime
+import urllib.request
+import urllib.parse
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import (
     Application,
@@ -19,7 +22,8 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8778116378:AAHvHV0ce7WlKItOfAGCOWL44I3AqRZHbBw")
 CHANNEL_USERNAME = "@jpg_to_pdf_otkaz"
 ADMIN_ID = 7406325328
-DB_FILE = "users.json"
+REDIS_URL = os.environ.get("REDIS_URL", "https://mutual-satyr-95515.upstash.io")
+REDIS_TOKEN = os.environ.get("REDIS_TOKEN", "gQAAAAAAAXUbAAIgcDE2ZWY1NjFlZWM0NTU0ODQxYjI1NDBlM2VlNWU3OTgzNA")
 # ====================================================
 
 logging.basicConfig(
@@ -31,16 +35,42 @@ logger = logging.getLogger(__name__)
 user_images: dict[int, list[bytes]] = {}
 
 
+# ==================== REDIS ====================
+def redis_get(key):
+    try:
+        url = f"{REDIS_URL}/get/{key}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {REDIS_TOKEN}"})
+        with urllib.request.urlopen(req) as r:
+            data = json.loads(r.read())
+            result = data.get("result")
+            if result:
+                return json.loads(result)
+    except Exception as e:
+        logger.error(f"Redis get xato: {e}")
+    return None
+
+
+def redis_set(key, value):
+    try:
+        encoded = urllib.parse.quote(json.dumps(value, ensure_ascii=False))
+        url = f"{REDIS_URL}/set/{key}/{encoded}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {REDIS_TOKEN}"})
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        logger.error(f"Redis set xato: {e}")
+    return None
+
+
 def load_db():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    return {"users": {}, "total_pdfs": 0}
+    db = redis_get("bot_db")
+    if db is None:
+        db = {"users": {}, "total_pdfs": 0}
+    return db
 
 
 def save_db(db):
-    with open(DB_FILE, "w") as f:
-        json.dump(db, f, indent=2)
+    redis_set("bot_db", db)
 
 
 def register_user(user):
@@ -64,6 +94,7 @@ def is_blocked(user_id):
     return db["users"].get(str(user_id), {}).get("blocked", False)
 
 
+# ==================== A'ZOLIK ====================
 async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
@@ -73,6 +104,7 @@ async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
         return False
 
 
+# ==================== HANDLERLAR ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user)
@@ -182,6 +214,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Rasmlar o'chirildi.")
 
 
+# ==================== ADMIN PANEL ====================
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     total_users = len(db["users"])
@@ -336,11 +369,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot ishga tushdi...")
-    # run_polling o'zi cheksiz ishlaydi
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
