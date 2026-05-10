@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 user_images: dict[int, list[bytes]] = {}
 
 
-# ==================== DATABASE ====================
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
@@ -65,7 +64,6 @@ def is_blocked(user_id):
     return db["users"].get(str(user_id), {}).get("blocked", False)
 
 
-# ==================== A'ZOLIK ====================
 async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
@@ -75,7 +73,6 @@ async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
         return False
 
 
-# ==================== HANDLERLAR ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user)
@@ -89,7 +86,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     is_subscribed = await check_subscription(user.id, context)
-    if is_subscribed or user.id == ADMIN_ID:
+    if is_subscribed:
         await update.message.reply_text(
             f"👋 Xush kelibsiz, {user.first_name}!\n\n"
             "📸 Rasm yuboring — PDF ga aylantirib beraman!\n"
@@ -185,7 +182,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Rasmlar o'chirildi.")
 
 
-# ==================== ADMIN PANEL ====================
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     total_users = len(db["users"])
@@ -205,7 +201,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚫 Bloklangan: <b>{blocked}</b>"
     )
 
-    if hasattr(update, 'callback_query') and update.callback_query:
+    if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
     else:
         await update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -224,7 +220,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user = query.from_user
 
-    # Oddiy foydalanuvchi uchun
     if data == "check_sub":
         if is_blocked(user.id):
             await query.edit_message_text("❌ Bloklangansiz.")
@@ -243,7 +238,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Hali a'zo bo'lmagansiz!", reply_markup=keyboard)
         return
 
-    # Admin uchun
     if user.id != ADMIN_ID:
         return
 
@@ -315,7 +309,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db = load_db()
         success = fail = 0
         for uid, udata in db["users"].items():
-            # Bloklangan bo'lmagan HAMMA foydalanuvchiga yuborish (admin ham o'ziga oladi)
             if not udata.get("blocked"):
                 try:
                     await context.bot.send_message(
@@ -343,7 +336,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot ishga tushdi...")
-    app.run_polling(drop_pending_updates=True)
+    # run_polling o'zi cheksiz ishlaydi
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
