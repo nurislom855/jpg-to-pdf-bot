@@ -1,0 +1,29 @@
+name: Telegram Bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'  # Har 5 daqiqada restart
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Python o'rnatish
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Kutubxonalarni o'rnatish
+        run: pip install python-telegram-bot Pillow img2pdf
+
+      - name: Botni ishga tushirish
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python bot.py
