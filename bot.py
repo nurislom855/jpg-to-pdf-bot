@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import json
 from PIL import Image
@@ -160,7 +161,9 @@ async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_images[user.id].append(image_bytes)
 
     count = len(user_images[user.id])
-    await update.message.reply_text(f"✅ {count} ta rasm qabul qilindi.\n📤 Ko'proq yuboring yoki /pdf yozing.")
+    await update.message.reply_text(
+        f"✅ {count} ta rasm qabul qilindi.\n📤 Ko'proq yuboring yoki /pdf yozing."
+    )
 
 
 async def generate_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -358,18 +361,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    while True:
+        try:
+            logger.info("Bot ishga tushdi...")
+            app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("pdf", generate_pdf))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CallbackQueryHandler(handle_callbacks))
-    app.add_handler(MessageHandler(filters.PHOTO, receive_image))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("pdf", generate_pdf))
+            app.add_handler(CommandHandler("cancel", cancel))
+            app.add_handler(CommandHandler("admin", admin_command))
+            app.add_handler(CallbackQueryHandler(handle_callbacks))
+            app.add_handler(MessageHandler(filters.PHOTO, receive_image))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Bot ishga tushdi...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+        except Exception as e:
+            logger.error(f"Bot xato bilan to'xtadi: {e}")
+            logger.info("5 soniyadan keyin qayta ishga tushadi...")
+            import time
+            time.sleep(5)
 
 
 if __name__ == "__main__":
