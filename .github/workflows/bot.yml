@@ -4,11 +4,13 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # Har 5 soatda qayta ishga tushadi
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 300  # 5 soat
 
     steps:
       - uses: actions/checkout@v4
@@ -24,4 +26,6 @@ jobs:
       - name: Botni ishga tushirish
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          REDIS_TOKEN: ${{ secrets.REDIS_TOKEN }}
         run: python bot.py
