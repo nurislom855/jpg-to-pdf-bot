@@ -1,34 +1,44 @@
 name: Telegram Bot
 
 on:
+  schedule:
+    - cron: '0 */5 * * *'   # har 5 soatda qayta yoqiladi
+  workflow_dispatch:          # qo'lda ishga tushirish uchun
   push:
     branches: [main]
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 290      # 4h 50min — 5 soatlik limitdan oldin to'xtaydi
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Python o'rnatish
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: LibreOffice o'rnatish (PPTX uchun)
-        run: sudo apt-get install -y libreoffice
+      - name: Install system dependencies (LibreOffice + Playwright)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libreoffice libreoffice-calc libreoffice-writer \
+            libreoffice-impress poppler-utils fonts-liberation fonts-dejavu
 
-      - name: Kutubxonalarni o'rnatish
-        run: pip install python-telegram-bot Pillow img2pdf
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pypdf
+          playwright install chromium
+          playwright install-deps chromium
 
-      - name: Botni ishga tushirish
+      - name: Run Bot
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          REDIS_URL: ${{ secrets.REDIS_URL }}
+          BOT_TOKEN:   ${{ secrets.BOT_TOKEN }}
+          REDIS_URL:   ${{ secrets.REDIS_URL }}
           REDIS_TOKEN: ${{ secrets.REDIS_TOKEN }}
-        run: python bot.py
+        run: |
+          timeout 17400 python bot.py || true
+          # 17400 sec = 4h 50min
