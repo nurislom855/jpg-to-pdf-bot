@@ -29,7 +29,7 @@ from telegram.ext import (
 
 # ==================== SOZLAMALAR ====================
 BOT_TOKEN         = os.environ.get("BOT_TOKEN", "8778116378:AAHvHV0ce7WlKItOfAGCOWL44I3AqRZHbBw")
-CHANNEL_USERNAME  = "@jpg_to_pdf_otkaz"
+CHANNEL_USERNAME  = "@nurislomai"
 ADMIN_ID          = 7406325328
 ADMIN_USERNAME    = "nurislomdev"
 REDIS_URL         = os.environ.get("REDIS_URL",   "https://mutual-satyr-95515.upstash.io")
