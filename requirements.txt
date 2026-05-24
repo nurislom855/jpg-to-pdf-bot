@@ -1,3 +1,5 @@
 python-telegram-bot==20.7
-Pillow==10.2.0
-img2pdf==0.5.1
+Pillow
+img2pdf
+pypdf
+playwright
