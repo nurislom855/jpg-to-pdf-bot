@@ -1,619 +1,1055 @@
 import os
+import sys
 import logging
-import asyncio
-import tempfile
+import json
+import time
 import subprocess
-from pathlib import Path
+import tempfile
+import asyncio
+from PIL import Image
+import img2pdf
 from io import BytesIO
+from datetime import datetime
+import urllib.request
+import urllib.parse
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, ChatMember
+    ChatMember, InputFile, ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardRemove
 )
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, ContextTypes
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
-from PIL import Image
-import img2pdf
-import redis
-from upstash_redis import Redis
 
-# ─────────────────────────── CONFIG ───────────────────────────
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "8778116378:AAHvHV0ce7WlKItOfAGCOWL44I3AqRZHbBw")
-CHANNEL_ID  = "@jpg_to_pdf_otkaz"
-ADMIN_ID    = 7406325328
-REDIS_URL   = os.getenv("REDIS_URL", "https://mutual-satyr-95515.upstash.io")
-REDIS_TOKEN = os.getenv("REDIS_TOKEN", "gQAAAAAAAXUbAAIgcDE2ZWY1NjFlZWM0NTU0ODQxYjI1NDBlM2VlNWU3OTgzNA")
+# ==================== SOZLAMALAR ====================
+BOT_TOKEN         = os.environ.get("BOT_TOKEN", "8778116378:AAHvHV0ce7WlKItOfAGCOWL44I3AqRZHbBw")
+CHANNEL_USERNAME  = "@jpg_to_pdf_otkaz"
+ADMIN_ID          = 7406325328
+ADMIN_USERNAME    = "nurislomdev"
+REDIS_URL         = os.environ.get("REDIS_URL",   "https://mutual-satyr-95515.upstash.io")
+REDIS_TOKEN       = os.environ.get("REDIS_TOKEN", "gQAAAAAAAXUbAAIgcDE2ZWY1NjFlZWM0NTU0ODQxYjI1NDBlM2VlNWU3OTgzNA")
 
-# ─────────────────────────── STATES ───────────────────────────
-WAITING_IMAGES   = 1
-WAITING_PPTX     = 2
-WAITING_RENAME   = 3
-WAITING_FEEDBACK = 4
-WAITING_WORD     = 5
-WAITING_PDF_MERGE = 6
-WAITING_TIMETABLE = 7
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────── REDIS ────────────────────────────
-rdb = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+# xotira
+user_images: dict[int, list[bytes]] = {}
+user_pdf_list: dict[int, list[tuple]] = {}   # PDF merge uchun [(name, bytes)]
+user_mode: dict[int, str] = {}
 
-def save_user(user_id: int, username: str, full_name: str):
-    key = f"user:{user_id}"
-    if not rdb.exists(key):
-        rdb.hset(key, mapping={
-            "username": username or "",
-            "full_name": full_name or "",
-            "joined": str(asyncio.get_event_loop().time()),
-        })
-        rdb.incr("stats:total_users")
-    rdb.incr("stats:total_requests")
 
-def get_stats():
-    total_users    = rdb.get("stats:total_users")    or 0
-    total_requests = rdb.get("stats:total_requests") or 0
-    return int(total_users), int(total_requests)
+# ==================== REPLY KEYBOARD ====================
+def main_reply_keyboard():
+    """Foydalanuvchi uchun quyi tugmalar paneli"""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📸 JPG → PDF"),    KeyboardButton("📄 Word → PDF")],
+            [KeyboardButton("📊 PPTX → PDF"),   KeyboardButton("🔗 PDF Birlashtirish")],
+            [KeyboardButton("📅 Dars jadvali"), KeyboardButton("💬 Admin")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Xizmatni tanlang..."
+    )
 
-def is_blocked(user_id: int) -> bool:
-    return bool(rdb.sismember("blocked_users", str(user_id)))
+def admin_reply_keyboard():
+    """Admin uchun quyi tugmalar paneli"""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("👥 Foydalanuvchilar"), KeyboardButton("📊 Statistika")],
+            [KeyboardButton("📣 Broadcast"),        KeyboardButton("🔍 Qidirish")],
+            [KeyboardButton("🔙 Asosiy menyu")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Admin amali..."
+    )
 
-def block_user(user_id: int):   rdb.sadd("blocked_users", str(user_id))
-def unblock_user(user_id: int): rdb.srem("blocked_users", str(user_id))
 
-def get_all_users():
-    keys = rdb.keys("user:*")
-    users = []
-    for k in keys:
-        uid = k.split(":")[1]
-        data = rdb.hgetall(k)
-        users.append((uid, data))
-    return users
-
-# ─────────────────────────── CHANNEL CHECK ────────────────────
-async def is_member(bot, user_id: int) -> bool:
+# ==================== REDIS ====================
+def redis_get(key):
     try:
-        m = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return m.status in [
-            ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER
-        ]
-    except Exception:
+        url = f"{REDIS_URL}/get/{urllib.parse.quote(key, safe='')}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {REDIS_TOKEN}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+            result = data.get("result")
+            if result:
+                return json.loads(result)
+    except Exception as e:
+        logger.error(f"Redis get xato: {e}")
+    return None
+
+
+def redis_set(key, value):
+    try:
+        payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        encoded = urllib.parse.quote(payload, safe="")
+        url = f"{REDIS_URL}/set/{urllib.parse.quote(key, safe='')}/{encoded}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {REDIS_TOKEN}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        logger.error(f"Redis set xato: {e}")
+    return None
+
+
+def load_db():
+    db = redis_get("bot_db")
+    if db is None:
+        db = {"users": {}, "total_pdfs": 0, "total_requests": 0}
+    if "total_requests" not in db:
+        db["total_requests"] = 0
+    return db
+
+
+def save_db(db):
+    redis_set("bot_db", db)
+
+
+def register_user(user):
+    db = load_db()
+    uid = str(user.id)
+    if uid not in db["users"]:
+        db["users"][uid] = {
+            "id": user.id,
+            "name": user.full_name,
+            "username": user.username or "",
+            "joined": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "pdfs": 0,
+            "blocked": False,
+            "last_active": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+    else:
+        db["users"][uid]["last_active"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_db(db)
+
+
+def is_blocked(user_id):
+    db = load_db()
+    return db["users"].get(str(user_id), {}).get("blocked", False)
+
+
+# ==================== A'ZOLIK ====================
+async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+    except Exception as e:
+        logger.error(f"Sub tekshirish xato: {e}")
         return False
 
-async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    if await is_member(context.bot, user_id):
+
+async def require_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """False qaytarsa — foydalanuvchi a'zo emas, xabar yuborildi."""
+    user = update.effective_user
+    if user.id == ADMIN_ID:
         return True
-    kb = [[InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=f"https://t.me/{CHANNEL_ID[1:]}"),
-           InlineKeyboardButton("✅ Tekshirish", callback_data="check_membership")]]
+    if await check_subscription(user.id, context):
+        return True
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=f"https://t.me/{CHANNEL_USERNAME[1:]}")],
+        [InlineKeyboardButton("✅ A'zo bo'ldim", callback_data="check_sub")],
+    ])
     await update.message.reply_text(
-        "⚠️ Botdan foydalanish uchun avval kanalga a'zo bo'ling!\n\n"
-        f"📢 Kanal: {CHANNEL_ID}",
-        reply_markup=InlineKeyboardMarkup(kb)
+        "⚠️ Botdan foydalanish uchun kanalga a'zo bo'ling!",
+        reply_markup=keyboard
     )
     return False
 
-# ─────────────────────────── /start ───────────────────────────
+
+# ==================== /start ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    register_user(user)
+
     if is_blocked(user.id):
-        await update.message.reply_text("❌ Siz bloklangansiz.")
+        await update.message.reply_text("❌ Siz botdan bloklangansiz.")
         return
 
-    save_user(user.id, user.username, user.full_name)
-
-    if not await require_membership(update, context):
+    if user.id == ADMIN_ID:
+        await update.message.reply_text(
+            "🛠 <b>Admin sifatida kirdingiz!</b>\n\nQuyidan amal tanlang:",
+            parse_mode="HTML",
+            reply_markup=admin_reply_keyboard()
+        )
         return
 
-    kb = [
-        [InlineKeyboardButton("📸 JPG → PDF",        callback_data="jpg_pdf"),
-         InlineKeyboardButton("📄 Word → PDF",        callback_data="word_pdf")],
-        [InlineKeyboardButton("📊 PPTX → PDF",        callback_data="pptx_pdf"),
-         InlineKeyboardButton("🔗 PDF Birlashtirish", callback_data="pdf_merge")],
-        [InlineKeyboardButton("✏️ Fayl nomini o'zgartirish", callback_data="rename")],
-        [InlineKeyboardButton("📅 Dars jadvali",      callback_data="timetable")],
-        [InlineKeyboardButton("💬 Admin bilan bog'lanish", callback_data="contact_admin")],
-    ]
+    if not await check_subscription(user.id, context):
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=f"https://t.me/{CHANNEL_USERNAME[1:]}")],
+            [InlineKeyboardButton("✅ A'zo bo'ldim", callback_data="check_sub")],
+        ])
+        await update.message.reply_text(
+            f"👋 Salom, {user.first_name}!\n\n⚠️ Botdan foydalanish uchun kanalga a'zo bo'ling:",
+            reply_markup=keyboard
+        )
+        return
+
     await update.message.reply_text(
-        f"👋 Salom, {user.first_name}!\n\n"
-        "🤖 Men sizga quyidagi xizmatlarni taklif etaman:\n\n"
-        "📸 <b>JPG → PDF</b> — rasmlarni PDFga aylantirish\n"
-        "📄 <b>Word → PDF</b> — .docx/.doc fayllarni PDFga\n"
-        "📊 <b>PPTX → PDF</b> — prezentatsiyani PDFga\n"
-        "🔗 <b>PDF Birlashtirish</b> — bir nechta PDFni birlashtirib yuborish\n"
-        "✏️ <b>Fayl nomini o'zgartirish</b>\n"
-        "📅 <b>Dars jadvali</b> — TSUE dars jadvalini ko'rish\n\n"
-        "Kerakli bo'limni tanlang 👇",
+        f"👋 Xush kelibsiz, <b>{user.first_name}</b>!\n\n"
+        "Quyidagi tugmalardan xizmatni tanlang 👇",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(kb)
+        reply_markup=main_reply_keyboard()
     )
 
-# ─────────────────────────── CALLBACK QUERY ───────────────────
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q    = update.callback_query
-    data = q.data
-    await q.answer()
 
-    # membership check
-    if data == "check_membership":
-        if await is_member(context.bot, q.from_user.id):
-            await q.message.reply_text("✅ Rahmat! Endi botdan foydalanishingiz mumkin.")
-            await start_from_callback(q, context)
-        else:
-            await q.answer("❌ Hali a'zo bo'lmadingiz!", show_alert=True)
-        return
-
-    if data == "jpg_pdf":
-        context.user_data["mode"]   = "jpg_pdf"
-        context.user_data["images"] = []
-        await q.message.reply_text(
-            "📸 Rasmlarni yuboring (1-100 ta JPG/PNG).\n"
-            "Hammasi yuborib bo'lgach /done bosing."
-        )
-
-    elif data == "word_pdf":
-        context.user_data["mode"] = "word_pdf"
-        await q.message.reply_text(
-            "📄 Word faylini yuboring (.docx yoki .doc format)."
-        )
-
-    elif data == "pptx_pdf":
-        context.user_data["mode"] = "pptx_pdf"
-        await q.message.reply_text(
-            "📊 PPTX faylini yuboring."
-        )
-
-    elif data == "pdf_merge":
-        context.user_data["mode"]     = "pdf_merge"
-        context.user_data["pdf_list"] = []
-        await q.message.reply_text(
-            "🔗 PDFlarni ketma-ket yuboring.\n"
-            "Hammasi yuborib bo'lgach /done bosing.\n"
-            "⚠️ Minimum 2 ta, maximum 20 ta PDF."
-        )
-
-    elif data == "rename":
-        context.user_data["mode"] = "rename_waiting_file"
-        await q.message.reply_text(
-            "✏️ Nomini o'zgartirmoqchi bo'lgan faylni yuboring."
-        )
-
-    elif data == "timetable":
-        context.user_data["mode"] = "timetable"
-        await q.message.reply_text(
-            "📅 Guruh nomini kiriting.\n"
-            "Masalan: <b>II-52/24</b> yoki <b>IB-11/23</b>",
-            parse_mode="HTML"
-        )
-
-    elif data == "contact_admin":
-        context.user_data["mode"] = "feedback"
-        await q.message.reply_text(
-            "💬 Xabaringizni yozing, admin @nurislomdev ga yetkazamiz."
-        )
-
-    elif data == "admin_panel":
-        if q.from_user.id == ADMIN_ID:
-            await show_admin_panel(q.message, context)
-
-    elif data == "admin_stats":
-        total_u, total_r = get_stats()
-        await q.message.reply_text(
-            f"📊 <b>Statistika</b>\n\n"
-            f"👤 Foydalanuvchilar: <b>{total_u}</b>\n"
-            f"🔄 So'rovlar: <b>{total_r}</b>",
-            parse_mode="HTML"
-        )
-
-    elif data == "admin_broadcast":
-        context.user_data["mode"] = "broadcast"
-        await q.message.reply_text("📣 Broadcast xabarini yozing:")
-
-    elif data == "admin_users":
-        users = get_all_users()
-        text  = f"👥 <b>Foydalanuvchilar ({len(users)})</b>\n\n"
-        for uid, d in users[:30]:
-            uname = d.get("username", "")
-            fname = d.get("full_name", "")
-            text += f"• {fname} (@{uname}) — <code>{uid}</code>\n"
-        await q.message.reply_text(text[:4000], parse_mode="HTML")
-
-# ─────────────────────────── FILE HANDLER ─────────────────────
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if is_blocked(user.id):
-        return
-
-    if not await require_membership(update, context):
-        return
-
-    mode = context.user_data.get("mode", "")
-    doc  = update.message.document
-
-    # ── WORD → PDF ─────────────────────────────────────────────
-    if mode == "word_pdf":
-        ext = Path(doc.file_name or "file.docx").suffix.lower()
-        if ext not in [".docx", ".doc"]:
-            await update.message.reply_text("❌ Faqat .docx yoki .doc fayl yuboring!")
-            return
-        await convert_office_to_pdf(update, context, doc, ext, "word")
-
-    # ── PPTX → PDF ─────────────────────────────────────────────
-    elif mode == "pptx_pdf":
-        ext = Path(doc.file_name or "file.pptx").suffix.lower()
-        if ext not in [".pptx", ".ppt"]:
-            await update.message.reply_text("❌ Faqat .pptx yoki .ppt fayl yuboring!")
-            return
-        await convert_office_to_pdf(update, context, doc, ext, "pptx")
-
-    # ── PDF MERGE collect ──────────────────────────────────────
-    elif mode == "pdf_merge":
-        ext = Path(doc.file_name or "file.pdf").suffix.lower()
-        if ext != ".pdf":
-            await update.message.reply_text("❌ Faqat PDF fayl yuboring!")
-            return
-        pdf_list = context.user_data.setdefault("pdf_list", [])
-        if len(pdf_list) >= 20:
-            await update.message.reply_text("⚠️ Maksimal 20 ta PDF!")
-            return
-        file = await doc.get_file()
-        data = await file.download_as_bytearray()
-        pdf_list.append((doc.file_name or f"file{len(pdf_list)}.pdf", bytes(data)))
-        await update.message.reply_text(
-            f"✅ PDF qabul qilindi ({len(pdf_list)} ta). "
-            "Davom etish uchun yana yuboring yoki /done bosing."
-        )
-
-    # ── RENAME - waiting file ──────────────────────────────────
-    elif mode == "rename_waiting_file":
-        file = await doc.get_file()
-        data = await file.download_as_bytearray()
-        context.user_data["rename_data"] = bytes(data)
-        context.user_data["rename_ext"]  = Path(doc.file_name or "file").suffix
-        context.user_data["mode"]        = "rename_waiting_name"
-        await update.message.reply_text(
-            "✏️ Yangi fayl nomini kiriting (kengaytimasiz):"
-        )
-
-
-async def convert_office_to_pdf(update, context, doc, ext, ftype):
-    msg = await update.message.reply_text("⏳ Konvertatsiya qilinmoqda...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        in_path  = os.path.join(tmpdir, f"input{ext}")
-        out_path = os.path.join(tmpdir, "input.pdf")
-
-        file = await doc.get_file()
-        await file.download_to_drive(in_path)
-
-        try:
-            subprocess.run(
-                ["libreoffice", "--headless", "--convert-to", "pdf",
-                 "--outdir", tmpdir, in_path],
-                check=True, timeout=120,
-                capture_output=True
-            )
-            with open(out_path, "rb") as f:
-                await update.message.reply_document(
-                    document=InputFile(f, filename="converted.pdf"),
-                    caption="✅ PDF tayyor!"
-                )
-            await msg.delete()
-            rdb.incr("stats:total_requests")
-        except Exception as e:
-            await msg.edit_text(f"❌ Xatolik: {e}")
-        finally:
-            context.user_data.pop("mode", None)
-
-# ─────────────────────────── PHOTO HANDLER ────────────────────
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if is_blocked(user.id):
-        return
-    if not await require_membership(update, context):
-        return
-
-    mode = context.user_data.get("mode", "")
-    if mode != "jpg_pdf":
-        # auto-detect: switch to jpg_pdf mode
-        context.user_data["mode"]   = "jpg_pdf"
-        context.user_data["images"] = []
-
-    photo = update.message.photo[-1]
-    file  = await photo.get_file()
-    data  = await file.download_as_bytearray()
-    context.user_data.setdefault("images", []).append(bytes(data))
-
-    count = len(context.user_data["images"])
-    if count == 1:
-        await update.message.reply_text(
-            "✅ 1 ta rasm qabul qilindi. Ko'proq yuboring yoki /done bosing."
-        )
-    else:
-        await update.message.reply_text(
-            f"✅ {count} ta rasm. /done bosing yoki davom eting."
-        )
-
-# ─────────────────────────── TEXT HANDLER ─────────────────────
+# ==================== TEXT HANDLER ====================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    user  = update.effective_user
+    text  = update.message.text.strip()
+    mode  = context.user_data.get("mode", "")
+
     if is_blocked(user.id):
+        await update.message.reply_text("❌ Bloklangansiz.")
         return
 
-    mode = context.user_data.get("mode", "")
-    text = update.message.text.strip()
+    # ── ADMIN tugmalari ────────────────────────────────────────
+    if user.id == ADMIN_ID:
+        if text == "👥 Foydalanuvchilar":
+            await admin_show_users(update, context, page=0)
+            return
+        if text == "📊 Statistika":
+            await admin_show_stats(update, context)
+            return
+        if text == "📣 Broadcast":
+            context.user_data["mode"] = "broadcast"
+            await update.message.reply_text(
+                "📣 Broadcast xabarini yozing:\n(Bekor qilish: /cancel)",
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Bekor qilish")]], resize_keyboard=True)
+            )
+            return
+        if text == "🔍 Qidirish":
+            context.user_data["mode"] = "admin_search"
+            await update.message.reply_text(
+                "🔍 Foydalanuvchi ID yoki @username kiriting:",
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Bekor qilish")]], resize_keyboard=True)
+            )
+            return
+        if text == "🔙 Asosiy menyu":
+            context.user_data.clear()
+            await update.message.reply_text(
+                "🛠 Admin panel:", reply_markup=admin_reply_keyboard()
+            )
+            return
+        if text == "❌ Bekor qilish":
+            context.user_data.clear()
+            await update.message.reply_text("❌ Bekor qilindi.", reply_markup=admin_reply_keyboard())
+            return
 
-    # ── Timetable query ────────────────────────────────────────
+    # ── FOYDALANUVCHI tugmalari ────────────────────────────────
+    if text == "📸 JPG → PDF":
+        if not await require_sub(update, context): return
+        context.user_data["mode"] = "jpg"
+        user_images[user.id] = []
+        await update.message.reply_text(
+            "📸 Rasmlarni yuboring (1-100 ta JPG/PNG).\n"
+            "Tayyor bo'lgach 👉 /done"
+        )
+        return
+
+    if text == "📄 Word → PDF":
+        if not await require_sub(update, context): return
+        context.user_data["mode"] = "word"
+        await update.message.reply_text("📄 Word faylini yuboring (.docx yoki .doc).")
+        return
+
+    if text == "📊 PPTX → PDF":
+        if not await require_sub(update, context): return
+        context.user_data["mode"] = "pptx"
+        await update.message.reply_text("📊 PPTX faylini yuboring.")
+        return
+
+    if text == "🔗 PDF Birlashtirish":
+        if not await require_sub(update, context): return
+        context.user_data["mode"] = "pdf_merge"
+        user_pdf_list[user.id] = []
+        await update.message.reply_text(
+            "🔗 PDFlarni ketma-ket yuboring (2-20 ta).\n"
+            "Tayyor bo'lgach 👉 /done"
+        )
+        return
+
+    if text == "📅 Dars jadvali":
+        if not await require_sub(update, context): return
+        context.user_data["mode"] = "timetable"
+        await update.message.reply_text(
+            "📅 Guruh nomini kiriting:\nMasalan: <code>II-52/24</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    if text == "💬 Admin":
+        context.user_data["mode"] = "feedback"
+        await update.message.reply_text(
+            "💬 Xabaringizni yozing, @nurislomdev ga yetkazamiz:"
+        )
+        return
+
+    # ── MODE ga qarab keyingi harakatlar ──────────────────────
+
     if mode == "timetable":
         await fetch_timetable(update, context, text)
         return
 
-    # ── Rename ─────────────────────────────────────────────────
-    if mode == "rename_waiting_name":
-        data = context.user_data.get("rename_data")
-        ext  = context.user_data.get("rename_ext", "")
-        if data:
-            new_name = text + ext
-            await update.message.reply_document(
-                document=InputFile(BytesIO(data), filename=new_name),
-                caption=f"✅ Yangi nom: <b>{new_name}</b>",
-                parse_mode="HTML"
-            )
-        context.user_data.pop("mode", None)
-        return
-
-    # ── Feedback ───────────────────────────────────────────────
     if mode == "feedback":
         uname = f"@{user.username}" if user.username else user.full_name
         await context.bot.send_message(
             ADMIN_ID,
             f"💬 <b>Yangi xabar</b>\n"
-            f"👤 {uname} (<code>{user.id}</code>)\n\n"
-            f"{text}",
+            f"👤 {uname} (<code>{user.id}</code>)\n\n{text}",
             parse_mode="HTML"
         )
         await update.message.reply_text("✅ Xabaringiz adminga yuborildi!")
-        context.user_data.pop("mode", None)
+        context.user_data.clear()
         return
 
-    # ── Broadcast (admin only) ─────────────────────────────────
     if mode == "broadcast" and user.id == ADMIN_ID:
-        users = get_all_users()
-        sent = 0
-        for uid, _ in users:
-            try:
-                await context.bot.send_message(int(uid), text)
-                sent += 1
-            except Exception:
-                pass
-        await update.message.reply_text(f"📣 {sent} ta foydalanuvchiga yuborildi.")
-        context.user_data.pop("mode", None)
+        db    = load_db()
+        sent  = fail = 0
+        for uid, udata in db["users"].items():
+            if not udata.get("blocked"):
+                try:
+                    await context.bot.send_message(
+                        int(uid), f"📢 <b>Admin xabari:</b>\n\n{text}", parse_mode="HTML"
+                    )
+                    sent += 1
+                except Exception:
+                    fail += 1
+        await update.message.reply_text(
+            f"📣 Natija:\n✅ Yuborildi: {sent}\n❌ Xato: {fail}",
+            reply_markup=admin_reply_keyboard()
+        )
+        context.user_data.clear()
         return
 
-    # ── Admin commands ─────────────────────────────────────────
-    if text == "/admin" and user.id == ADMIN_ID:
-        await show_admin_panel(update.message, context)
+    if mode == "admin_search" and user.id == ADMIN_ID:
+        await admin_search_user(update, context, text)
         return
 
-    if text.startswith("/block ") and user.id == ADMIN_ID:
-        uid = text.split()[1]
-        block_user(int(uid))
-        await update.message.reply_text(f"🚫 {uid} bloklandi.")
+    if mode == "waiting_pdf_name":
+        context.user_data["mode"] = ""
+        await generate_pdf_from_images(update, context, text)
         return
 
-    if text.startswith("/unblock ") and user.id == ADMIN_ID:
-        uid = text.split()[1]
-        unblock_user(int(uid))
-        await update.message.reply_text(f"✅ {uid} blokdan chiqarildi.")
-        return
-
-    # ── Default: show menu ─────────────────────────────────────
-    await start(update, context)
-
-
-# ─────────────────────────── /done ────────────────────────────
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode = context.user_data.get("mode", "")
-
-    # ── JPG → PDF ──────────────────────────────────────────────
-    if mode == "jpg_pdf":
-        images = context.user_data.get("images", [])
-        if not images:
-            await update.message.reply_text("❌ Hech qanday rasm yuborilmadi.")
-            return
-        msg = await update.message.reply_text(f"⏳ {len(images)} ta rasmdan PDF yaratilmoqda...")
-        try:
-            pdf_bytes = img2pdf.convert(images)
+    if mode == "waiting_pptx_name":
+        context.user_data["mode"] = ""
+        filename = text if text.endswith(".pdf") else text + ".pdf"
+        pdf_bytes = context.user_data.pop("pptx_pdf", None)
+        if pdf_bytes:
             await update.message.reply_document(
-                document=InputFile(BytesIO(pdf_bytes), filename="images.pdf"),
-                caption=f"✅ {len(images)} ta rasmdan PDF tayyor!"
+                document=InputFile(BytesIO(pdf_bytes), filename=filename),
+                caption=f"✅ <b>{filename}</b> tayyor!", parse_mode="HTML"
             )
-            await msg.delete()
-            rdb.incr("stats:total_requests")
-        except Exception as e:
-            await msg.edit_text(f"❌ Xatolik: {e}")
-        finally:
-            context.user_data.pop("images", None)
-            context.user_data.pop("mode", None)
+        await update.message.reply_text("Boshqa xizmat:", reply_markup=main_reply_keyboard())
+        return
 
-    # ── PDF Merge ──────────────────────────────────────────────
-    elif mode == "pdf_merge":
-        pdf_list = context.user_data.get("pdf_list", [])
-        if len(pdf_list) < 2:
-            await update.message.reply_text("⚠️ Birlashtirish uchun kamida 2 ta PDF kerak!")
-            return
-        msg = await update.message.reply_text(f"⏳ {len(pdf_list)} ta PDF birlashtirilmoqda...")
-        try:
-            from pypdf import PdfWriter
-            writer = PdfWriter()
-            for name, data in pdf_list:
-                reader_io = BytesIO(data)
-                from pypdf import PdfReader
-                reader = PdfReader(reader_io)
-                for page in reader.pages:
-                    writer.add_page(page)
-            out_io = BytesIO()
-            writer.write(out_io)
-            out_io.seek(0)
+    if mode == "waiting_word_name":
+        context.user_data["mode"] = ""
+        filename = text if text.endswith(".pdf") else text + ".pdf"
+        pdf_bytes = context.user_data.pop("word_pdf", None)
+        if pdf_bytes:
             await update.message.reply_document(
-                document=InputFile(out_io, filename="merged.pdf"),
-                caption=f"✅ {len(pdf_list)} ta PDF birlashtirildi!"
+                document=InputFile(BytesIO(pdf_bytes), filename=filename),
+                caption=f"✅ <b>{filename}</b> tayyor!", parse_mode="HTML"
             )
-            await msg.delete()
-            rdb.incr("stats:total_requests")
-        except ImportError:
-            await msg.edit_text("❌ pypdf kutubxonasi o'rnatilmagan. requirements.txt ga qo'shing.")
-        except Exception as e:
-            await msg.edit_text(f"❌ Xatolik: {e}")
-        finally:
-            context.user_data.pop("pdf_list", None)
-            context.user_data.pop("mode", None)
+        await update.message.reply_text("Boshqa xizmat:", reply_markup=main_reply_keyboard())
+        return
+
+    # Default
+    if user.id == ADMIN_ID:
+        await update.message.reply_text("👆 Yuqoridagi tugmalardan foydalaning.", reply_markup=admin_reply_keyboard())
     else:
-        await update.message.reply_text("ℹ️ Hech qanday fayl yuborilmadi.")
+        await update.message.reply_text("👆 Tugmalardan xizmatni tanlang.", reply_markup=main_reply_keyboard())
 
 
-# ─────────────────────────── TIMETABLE ────────────────────────
-async def fetch_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE, group: str):
-    msg = await update.message.reply_text(
-        f"⏳ <b>{group}</b> guruhi dars jadvali qidirilmoqda...",
-        parse_mode="HTML"
+# ==================== PHOTO HANDLER ====================
+async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_blocked(user.id): return
+    if not await require_sub(update, context): return
+
+    if context.user_data.get("mode") != "jpg":
+        context.user_data["mode"] = "jpg"
+        user_images[user.id] = []
+
+    photo = update.message.photo[-1]
+    file  = await photo.get_file()
+    data  = bytes(await file.download_as_bytearray())
+    user_images.setdefault(user.id, []).append(data)
+
+    count = len(user_images[user.id])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 PDF yaratish", callback_data="create_pdf")],
+        [InlineKeyboardButton("🗑 Bekor qilish",  callback_data="cancel_all")],
+    ])
+    await update.message.reply_text(
+        f"✅ {count} ta rasm qabul qilindi.\n/done yoki tugma bosing:",
+        reply_markup=kb
     )
+
+
+# ==================== DOCUMENT HANDLER ====================
+async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_blocked(user.id): return
+    if not await require_sub(update, context): return
+
+    doc  = update.message.document
+    mode = context.user_data.get("mode", "")
+    ext  = os.path.splitext(doc.file_name or "")[1].lower()
+
+    # ── PPTX → PDF ────────────────────────────────────────────
+    if mode == "pptx" or ext in (".pptx", ".ppt"):
+        if ext not in (".pptx", ".ppt"):
+            await update.message.reply_text("❌ Faqat .pptx yoki .ppt fayl yuboring!")
+            return
+        await convert_office_to_pdf(update, context, doc, ext, "pptx")
+
+    # ── WORD → PDF ────────────────────────────────────────────
+    elif mode == "word" or ext in (".docx", ".doc"):
+        if ext not in (".docx", ".doc"):
+            await update.message.reply_text("❌ Faqat .docx yoki .doc fayl yuboring!")
+            return
+        await convert_office_to_pdf(update, context, doc, ext, "word")
+
+    # ── PDF MERGE ─────────────────────────────────────────────
+    elif mode == "pdf_merge" or ext == ".pdf":
+        lst = user_pdf_list.setdefault(user.id, [])
+        if len(lst) >= 20:
+            await update.message.reply_text("⚠️ Maksimal 20 ta PDF!")
+            return
+        file = await doc.get_file()
+        data = bytes(await file.download_as_bytearray())
+        lst.append((doc.file_name or f"file{len(lst)}.pdf", data))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Birlashtirish ({len(lst)} ta)", callback_data="merge_now")],
+            [InlineKeyboardButton("🗑 Bekor qilish", callback_data="cancel_all")],
+        ])
+        await update.message.reply_text(
+            f"📎 {len(lst)} ta PDF qabul qilindi. Yana yuboring yoki birlashtiring:",
+            reply_markup=kb
+        )
+        context.user_data["mode"] = "pdf_merge"
+
+    else:
+        await update.message.reply_text("❓ Noma'lum fayl. Avval xizmat tanlang.")
+
+
+# ==================== OFFICE → PDF ====================
+async def convert_office_to_pdf(update, context, doc, ext, ftype):
+    msg = await update.message.reply_text("⏳ Konvertatsiya qilinmoqda...")
     try:
-        screenshot = await capture_timetable_screenshot(group)
-        if screenshot:
-            await update.message.reply_photo(
-                photo=InputFile(BytesIO(screenshot), filename="timetable.png"),
-                caption=f"📅 <b>{group}</b> — Dars jadvali\n🏫 TSUE",
-                parse_mode="HTML"
+        file = await doc.get_file()
+        raw  = bytes(await file.download_as_bytearray())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            in_path  = os.path.join(tmp, f"input{ext}")
+            out_path = os.path.join(tmp, "input.pdf")
+            with open(in_path, "wb") as f:
+                f.write(raw)
+
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "pdf",
+                 "--outdir", tmp, in_path],
+                check=True, timeout=120, capture_output=True
             )
-            await msg.delete()
-        else:
-            await msg.edit_text(
-                f"❌ <b>{group}</b> guruhi topilmadi.\n"
-                "Guruh nomini to'g'ri kiriting. Masalan: <code>II-52/24</code>",
-                parse_mode="HTML"
-            )
+
+            if not os.path.exists(out_path):
+                raise FileNotFoundError("PDF yaratilmadi")
+
+            with open(out_path, "rb") as f:
+                pdf_bytes = f.read()
+
+        context.user_data[f"{ftype}_pdf"]      = pdf_bytes
+        context.user_data[f"{ftype}_pdf_name"] = doc.file_name.replace(ext, ".pdf")
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yuborish",            callback_data=f"send_{ftype}_pdf")],
+            [InlineKeyboardButton("✏️ Nomini o'zgartirish", callback_data=f"rename_{ftype}_pdf")],
+        ])
+        await msg.edit_text(
+            f"✅ Tayyor! Fayl: <b>{context.user_data[f'{ftype}_pdf_name']}</b>\nNima qilasiz?",
+            reply_markup=kb, parse_mode="HTML"
+        )
+        _inc_requests()
+
+    except subprocess.CalledProcessError:
+        await msg.edit_text("❌ LibreOffice xatosi. Fayl shikastlangan bo'lishi mumkin.")
     except Exception as e:
         await msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
     finally:
         context.user_data.pop("mode", None)
 
 
-async def capture_timetable_screenshot(group: str) -> bytes | None:
-    """Playwright orqali TSUE timetable saytidan guruh jadvalini screenshot qilish."""
+def _inc_requests():
+    db = load_db()
+    db["total_requests"] = db.get("total_requests", 0) + 1
+    save_db(db)
+
+
+# ==================== JPG → PDF ====================
+async def generate_pdf_from_images(update, context, filename="rasmlar"):
+    user   = update.effective_user
+    msg_fn = update.message or (update.callback_query.message if update.callback_query else None)
+    images = user_images.get(user.id, [])
+
+    if not images:
+        await msg_fn.reply_text("❌ Rasm topilmadi!")
+        return
+
+    wait = await msg_fn.reply_text(f"⏳ {len(images)} ta rasmdan PDF yaratilmoqda...")
+    try:
+        pdf_imgs = []
+        for b in images:
+            img = Image.open(BytesIO(b))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=95)
+            pdf_imgs.append(out.getvalue())
+
+        pdf_output = BytesIO(img2pdf.convert(pdf_imgs))
+        safe = filename if filename.endswith(".pdf") else f"{filename}.pdf"
+
+        await msg_fn.reply_document(
+            document=InputFile(pdf_output, filename=safe),
+            caption=f"✅ {len(images)} ta rasmdan <b>{safe}</b> yaratildi!",
+            parse_mode="HTML"
+        )
+        await wait.delete()
+
+        db  = load_db()
+        uid = str(user.id)
+        db["total_pdfs"] = db.get("total_pdfs", 0) + 1
+        if uid in db["users"]:
+            db["users"][uid]["pdfs"] += 1
+        save_db(db)
+
+        user_images.pop(user.id, None)
+        context.user_data.clear()
+        await msg_fn.reply_text("Boshqa xizmat:", reply_markup=main_reply_keyboard())
+
+    except Exception as e:
+        logger.error(f"PDF xato: {e}")
+        await wait.edit_text(f"❌ Xato: {str(e)[:200]}")
+
+
+# ==================== PDF MERGE ====================
+async def do_merge_pdfs(update, context):
+    user    = update.effective_user
+    msg_obj = update.callback_query.message if update.callback_query else update.message
+    lst     = user_pdf_list.get(user.id, [])
+
+    if len(lst) < 2:
+        await msg_obj.reply_text("⚠️ Kamida 2 ta PDF kerak!")
+        return
+
+    wait = await msg_obj.reply_text(f"⏳ {len(lst)} ta PDF birlashtirilmoqda...")
+    try:
+        from pypdf import PdfWriter, PdfReader
+        writer = PdfWriter()
+        for name, data in lst:
+            reader = PdfReader(BytesIO(data))
+            for page in reader.pages:
+                writer.add_page(page)
+        out = BytesIO()
+        writer.write(out)
+        out.seek(0)
+
+        await msg_obj.reply_document(
+            document=InputFile(out, filename="merged.pdf"),
+            caption=f"✅ {len(lst)} ta PDF birlashtirildi!"
+        )
+        await wait.delete()
+        user_pdf_list.pop(user.id, None)
+        context.user_data.clear()
+        _inc_requests()
+        await msg_obj.reply_text("Boshqa xizmat:", reply_markup=main_reply_keyboard())
+
+    except ImportError:
+        await wait.edit_text("❌ <code>pypdf</code> o'rnatilmagan. requirements.txt ga qo'shing.", parse_mode="HTML")
+    except Exception as e:
+        await wait.edit_text(f"❌ Xato: {str(e)[:200]}")
+
+
+# ==================== TIMETABLE ====================
+async def fetch_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE, group: str):
+    msg = await update.message.reply_text(
+        f"⏳ <b>{group}</b> guruhi dars jadvali qidirilmoqda...", parse_mode="HTML"
+    )
+    try:
+        screenshot = await capture_timetable(group)
+        if screenshot and len(screenshot) > 2000:
+            await update.message.reply_photo(
+                photo=InputFile(BytesIO(screenshot), filename="timetable.png"),
+                caption=f"📅 <b>{group}</b> — Dars jadvali\n🏫 TSUE", parse_mode="HTML"
+            )
+            await msg.delete()
+        else:
+            await msg.edit_text(
+                f"❌ <b>{group}</b> guruhi topilmadi.\n"
+                "To'g'ri format: <code>II-52/24</code>", parse_mode="HTML"
+            )
+    except Exception as e:
+        await msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
+    finally:
+        context.user_data.clear()
+        await update.message.reply_text("Boshqa xizmat:", reply_markup=main_reply_keyboard())
+
+
+async def capture_timetable(group: str) -> bytes | None:
     script = f"""
-import asyncio
+import asyncio, sys
 from playwright.async_api import async_playwright
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage", "--disable-gpu"]
-        )
-        page = await browser.new_page(viewport={{"width": 1400, "height": 900}})
-        await page.goto("https://tsue.edupage.org/timetable/", wait_until="networkidle", timeout=30000)
+        browser = await p.chromium.launch(args=[
+            "--no-sandbox","--disable-setuid-sandbox",
+            "--disable-dev-shm-usage","--disable-gpu"
+        ])
+        page = await browser.new_page(viewport={{"width":1400,"height":900}})
+        await page.goto("https://tsue.edupage.org/timetable/",
+                        wait_until="networkidle", timeout=30000)
 
-        # Guruh qidirish inputini top
-        await page.wait_for_selector("input[type='text'], input.search, #search", timeout=10000)
-
-        # Qidiruv
-        inputs = await page.query_selector_all("input")
-        for inp in inputs:
+        # input topib guruh nomini yoz
+        for sel in ["input.search-input","input[type='text']","#search",".searchField input"]:
             try:
-                await inp.fill("{group}")
-                await asyncio.sleep(1)
-                # Suggestion listdan tanlash
-                suggestions = await page.query_selector_all(".autocomplete-item, li.item, .suggestion")
-                for s in suggestions:
-                    t = await s.inner_text()
-                    if "{group}".lower() in t.lower():
-                        await s.click()
-                        await asyncio.sleep(2)
-                        break
+                el = await page.wait_for_selector(sel, timeout=4000)
+                await el.fill("{group}")
+                await asyncio.sleep(1.5)
+                # suggestion bor-yoqligini tekshir
+                for item_sel in [".autocomplete-item",".suggestion","li.ui-menu-item","ul.ui-autocomplete li"]:
+                    items = await page.query_selector_all(item_sel)
+                    for item in items:
+                        t = await item.inner_text()
+                        if "{group}".lower().replace("-","") in t.lower().replace("-",""):
+                            await item.click()
+                            await asyncio.sleep(2.5)
+                            break
                 break
             except Exception:
                 continue
 
         await asyncio.sleep(2)
-
-        # Jadval elementini topish va screenshot
-        timetable = await page.query_selector(".timetable, #timetable, .printTimetable, table")
-        if timetable:
-            screenshot = await timetable.screenshot()
-        else:
-            screenshot = await page.screenshot(full_page=False)
-
+        # jadval elementini qidirish
+        for sel in [".printTimetable","#timetable",".timetable","table.table"]:
+            el = await page.query_selector(sel)
+            if el:
+                shot = await el.screenshot(type="png")
+                sys.stdout.buffer.write(shot)
+                await browser.close()
+                return
+        # to'liq sahifa screenshot
+        shot = await page.screenshot(full_page=False, type="png")
+        sys.stdout.buffer.write(shot)
         await browser.close()
-
-        import sys
-        sys.stdout.buffer.write(screenshot)
 
 asyncio.run(main())
 """
     proc = await asyncio.create_subprocess_exec(
         "python3", "-c", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return None
+    return stdout if proc.returncode == 0 else None
 
-    if proc.returncode == 0 and stdout and len(stdout) > 1000:
-        return stdout
-    return None
+
+# ==================== /done ====================
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    mode = context.user_data.get("mode", "")
+
+    if mode == "jpg" and user.id in user_images and user_images[user.id]:
+        await generate_pdf_from_images(update, context, "rasmlar")
+    elif mode == "pdf_merge":
+        await do_merge_pdfs(update, context)
+    else:
+        await update.message.reply_text("ℹ️ Hech qanday fayl topilmadi.")
 
 
-# ─────────────────────────── ADMIN PANEL ──────────────────────
-async def show_admin_panel(message, context):
-    total_u, total_r = get_stats()
-    kb = [
-        [InlineKeyboardButton("📊 Statistika",     callback_data="admin_stats"),
-         InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin_users")],
-        [InlineKeyboardButton("📣 Broadcast",      callback_data="admin_broadcast")],
-    ]
-    await message.reply_text(
-        f"🔧 <b>Admin Panel</b>\n\n"
-        f"👤 Foydalanuvchilar: <b>{total_u}</b>\n"
-        f"🔄 So'rovlar: <b>{total_r}</b>\n\n"
-        "Amalni tanlang:",
+# ==================== CALLBACKS ====================
+async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    data = q.data
+    user = q.from_user
+    await q.answer()
+
+    # A'zolik
+    if data == "check_sub":
+        if is_blocked(user.id):
+            await q.edit_message_text("❌ Bloklangansiz."); return
+        if await check_subscription(user.id, context):
+            await q.edit_message_text(f"✅ Rahmat, {user.first_name}!")
+            await context.bot.send_message(
+                user.id,
+                "Xizmatni tanlang 👇",
+                reply_markup=main_reply_keyboard()
+            )
+        else:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=f"https://t.me/{CHANNEL_USERNAME[1:]}")],
+                [InlineKeyboardButton("✅ A'zo bo'ldim", callback_data="check_sub")],
+            ])
+            await q.edit_message_text("❌ Hali a'zo bo'lmadingiz!", reply_markup=kb)
+        return
+
+    # JPG → PDF
+    if data == "create_pdf":
+        images = user_images.get(user.id, [])
+        if not images:
+            await q.edit_message_text("❌ Rasm topilmadi!"); return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Standart nom", callback_data="default_pdf_name")],
+            [InlineKeyboardButton("✏️ Nom o'zgartirish", callback_data="rename_jpg_pdf")],
+        ])
+        await q.edit_message_text(
+            f"📄 {len(images)} ta rasm tayyor. Fayl nomini tanlang:", reply_markup=kb
+        )
+        return
+
+    if data == "default_pdf_name":
+        await q.edit_message_text("⏳ PDF yaratilmoqda...")
+        await generate_pdf_from_images(update, context, "rasmlar")
+        return
+
+    if data == "rename_jpg_pdf":
+        context.user_data["mode"] = "waiting_pdf_name"
+        await q.edit_message_text("✏️ Yangi fayl nomini yozing:")
+        return
+
+    if data == "cancel_all":
+        user_images.pop(user.id, None)
+        user_pdf_list.pop(user.id, None)
+        context.user_data.clear()
+        await q.edit_message_text("🗑 Bekor qilindi.")
+        await context.bot.send_message(user.id, "Xizmatni tanlang:", reply_markup=main_reply_keyboard())
+        return
+
+    # PDF merge
+    if data == "merge_now":
+        await do_merge_pdfs(update, context)
+        return
+
+    # PPTX PDF yuborish
+    if data == "send_pptx_pdf":
+        pdf_bytes = context.user_data.pop("pptx_pdf", None)
+        filename  = context.user_data.pop("pptx_pdf_name", "fayl.pdf")
+        if pdf_bytes:
+            await q.message.reply_document(
+                InputFile(BytesIO(pdf_bytes), filename=filename),
+                caption=f"✅ <b>{filename}</b> tayyor!", parse_mode="HTML"
+            )
+        await q.message.reply_text("Boshqa xizmat:", reply_markup=main_reply_keyboard())
+        return
+
+    if data == "rename_pptx_pdf":
+        context.user_data["mode"] = "waiting_pptx_name"
+        await q.edit_message_text("✏️ Yangi fayl nomini yozing:")
+        return
+
+    # Word PDF yuborish
+    if data == "send_word_pdf":
+        pdf_bytes = context.user_data.pop("word_pdf", None)
+        filename  = context.user_data.pop("word_pdf_name", "fayl.pdf")
+        if pdf_bytes:
+            await q.message.reply_document(
+                InputFile(BytesIO(pdf_bytes), filename=filename),
+                caption=f"✅ <b>{filename}</b> tayyor!", parse_mode="HTML"
+            )
+        await q.message.reply_text("Boshqa xizmat:", reply_markup=main_reply_keyboard())
+        return
+
+    if data == "rename_word_pdf":
+        context.user_data["mode"] = "waiting_word_name"
+        await q.edit_message_text("✏️ Yangi fayl nomini yozing:")
+        return
+
+    # ── ADMIN callbacks ────────────────────────────────────────
+    if user.id != ADMIN_ID:
+        return
+
+    if data == "admin_stats":
+        await admin_show_stats_cb(q)
+        return
+
+    if data == "admin_users":
+        await admin_show_users_cb(q, context, page=0)
+        return
+
+    if data == "admin_broadcast":
+        context.user_data["mode"] = "broadcast"
+        await q.edit_message_text("📣 Broadcast xabarini yozing:")
+        return
+
+    if data == "admin_back":
+        db = load_db()
+        blocked = sum(1 for u in db["users"].values() if u.get("blocked"))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin_users")],
+            [InlineKeyboardButton("📊 Statistika",       callback_data="admin_stats")],
+            [InlineKeyboardButton("📣 Broadcast",        callback_data="admin_broadcast")],
+        ])
+        await q.edit_message_text(
+            f"🛠 <b>Admin Panel</b>\n\n"
+            f"👥 Jami: <b>{len(db['users'])}</b>\n"
+            f"📄 PDF: <b>{db.get('total_pdfs',0)}</b>\n"
+            f"🚫 Bloklangan: <b>{blocked}</b>",
+            reply_markup=kb, parse_mode="HTML"
+        )
+        return
+
+    if data.startswith("block_"):
+        uid = data.split("_", 1)[1]
+        db  = load_db()
+        if uid in db["users"]:
+            db["users"][uid]["blocked"] = True
+            save_db(db)
+        await admin_show_users_cb(q, context, page=0)
+        return
+
+    if data.startswith("unblock_"):
+        uid = data.split("_", 1)[1]
+        db  = load_db()
+        if uid in db["users"]:
+            db["users"][uid]["blocked"] = False
+            save_db(db)
+        await admin_show_users_cb(q, context, page=0)
+        return
+
+    if data.startswith("users_page_"):
+        page = int(data.split("_")[-1])
+        await admin_show_users_cb(q, context, page=page)
+        return
+
+    if data.startswith("user_detail_"):
+        uid = data.split("_", 2)[2]
+        await admin_user_detail_cb(q, uid)
+        return
+
+
+# ==================== ADMIN HELPERS ====================
+PAGE_SIZE = 8
+
+async def admin_show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db      = load_db()
+    blocked = sum(1 for u in db["users"].values() if u.get("blocked"))
+    active  = len(db["users"]) - blocked
+    await update.message.reply_text(
+        "📊 <b>Statistika</b>\n\n"
+        f"👥 Jami foydalanuvchilar: <b>{len(db['users'])}</b>\n"
+        f"✅ Faol: <b>{active}</b>\n"
+        f"🚫 Bloklangan: <b>{blocked}</b>\n"
+        f"📄 Jami PDF: <b>{db.get('total_pdfs', 0)}</b>\n"
+        f"🔄 Jami so'rovlar: <b>{db.get('total_requests', 0)}</b>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(kb)
+        reply_markup=admin_reply_keyboard()
+    )
+
+async def admin_show_stats_cb(q):
+    db      = load_db()
+    blocked = sum(1 for u in db["users"].values() if u.get("blocked"))
+    active  = len(db["users"]) - blocked
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")]])
+    await q.edit_message_text(
+        "📊 <b>Statistika</b>\n\n"
+        f"👥 Jami: <b>{len(db['users'])}</b>\n"
+        f"✅ Faol: <b>{active}</b>\n"
+        f"🚫 Bloklangan: <b>{blocked}</b>\n"
+        f"📄 PDF: <b>{db.get('total_pdfs', 0)}</b>\n"
+        f"🔄 So'rovlar: <b>{db.get('total_requests', 0)}</b>",
+        reply_markup=kb, parse_mode="HTML"
     )
 
 
-async def start_from_callback(query, context):
-    kb = [
-        [InlineKeyboardButton("📸 JPG → PDF",        callback_data="jpg_pdf"),
-         InlineKeyboardButton("📄 Word → PDF",        callback_data="word_pdf")],
-        [InlineKeyboardButton("📊 PPTX → PDF",        callback_data="pptx_pdf"),
-         InlineKeyboardButton("🔗 PDF Birlashtirish", callback_data="pdf_merge")],
-        [InlineKeyboardButton("✏️ Fayl nomini o'zgartirish", callback_data="rename")],
-        [InlineKeyboardButton("📅 Dars jadvali",      callback_data="timetable")],
-        [InlineKeyboardButton("💬 Admin bilan bog'lanish", callback_data="contact_admin")],
-    ]
-    await query.message.reply_text(
-        "✅ A'zolik tasdiqlandi! Xizmatni tanlang:",
-        reply_markup=InlineKeyboardMarkup(kb)
+async def admin_show_users(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
+    db    = load_db()
+    users = list(db["users"].values())
+    total = len(users)
+    start = page * PAGE_SIZE
+    chunk = users[start: start + PAGE_SIZE]
+
+    lines = [f"👥 <b>Foydalanuvchilar</b> ({total} ta) — {page+1}-sahifa\n"]
+    buttons = []
+    for u in chunk:
+        icon  = "🚫" if u.get("blocked") else "✅"
+        uname = f"@{u['username']}" if u["username"] else "—"
+        lines.append(f"{icon} <b>{u['name']}</b> ({uname}) | PDF: {u.get('pdfs',0)} | {u.get('joined','')}")
+        buttons.append([
+            InlineKeyboardButton(
+                f"{icon} {u['name'][:18]}",
+                callback_data=f"user_detail_{u['id']}"
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"users_page_{page-1}"))
+    if start + PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"users_page_{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
-# ─────────────────────────── MAIN ─────────────────────────────
+async def admin_show_users_cb(q, context, page=0):
+    db    = load_db()
+    users = list(db["users"].values())
+    total = len(users)
+    start = page * PAGE_SIZE
+    chunk = users[start: start + PAGE_SIZE]
+
+    lines   = [f"👥 <b>Foydalanuvchilar</b> ({total} ta) — {page+1}-sahifa\n"]
+    buttons = []
+    for u in chunk:
+        icon  = "🚫" if u.get("blocked") else "✅"
+        uname = f"@{u['username']}" if u["username"] else "—"
+        lines.append(f"{icon} <b>{u['name']}</b> ({uname}) | PDF: {u.get('pdfs',0)}")
+        buttons.append([
+            InlineKeyboardButton(
+                f"{icon} {u['name'][:18]}",
+                callback_data=f"user_detail_{u['id']}"
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"users_page_{page-1}"))
+    if start + PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"users_page_{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")])
+
+    await q.edit_message_text(
+        "\n".join(lines), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def admin_user_detail_cb(q, uid: str):
+    db   = load_db()
+    u    = db["users"].get(uid)
+    if not u:
+        await q.edit_message_text("❌ Foydalanuvchi topilmadi."); return
+
+    icon  = "🚫 Bloklangan" if u.get("blocked") else "✅ Faol"
+    uname = f"@{u['username']}" if u["username"] else "—"
+    text  = (
+        f"👤 <b>{u['name']}</b>\n"
+        f"🆔 <code>{u['id']}</code>\n"
+        f"📱 Username: {uname}\n"
+        f"📅 Qo'shildi: {u.get('joined','—')}\n"
+        f"⏱ Oxirgi faollik: {u.get('last_active','—')}\n"
+        f"📄 PDF yaratdi: {u.get('pdfs', 0)}\n"
+        f"Status: {icon}"
+    )
+
+    if u.get("blocked"):
+        action_btn = InlineKeyboardButton("🔓 Blokni ochish", callback_data=f"unblock_{uid}")
+    else:
+        action_btn = InlineKeyboardButton("🚫 Bloklash",      callback_data=f"block_{uid}")
+
+    kb = InlineKeyboardMarkup([
+        [action_btn],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="admin_users")],
+    ])
+    await q.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+async def admin_search_user(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
+    db    = load_db()
+    found = []
+    q_low = query.lower().lstrip("@")
+    for uid, u in db["users"].items():
+        if (q_low in str(u["id"])) or (q_low in u.get("username","").lower()) or (q_low in u["name"].lower()):
+            found.append(u)
+
+    if not found:
+        await update.message.reply_text(
+            f"❌ '{query}' topilmadi.", reply_markup=admin_reply_keyboard()
+        )
+        context.user_data.clear()
+        return
+
+    lines   = [f"🔍 <b>Natijalar ({len(found)} ta):</b>\n"]
+    buttons = []
+    for u in found[:10]:
+        icon  = "🚫" if u.get("blocked") else "✅"
+        uname = f"@{u['username']}" if u["username"] else "—"
+        lines.append(f"{icon} <b>{u['name']}</b> ({uname}) | <code>{u['id']}</code>")
+        buttons.append([
+            InlineKeyboardButton(
+                f"{icon} {u['name'][:20]}",
+                callback_data=f"user_detail_{u['id']}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="admin_back")])
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    context.user_data.clear()
+
+
+# ==================== MAIN ====================
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    while True:
+        try:
+            logger.info("Bot ishga tushdi...")
+            app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("done",  done))
-    app.add_handler(CommandHandler("admin", lambda u, c: show_admin_panel(u.message, c)
-                                   if u.effective_user.id == ADMIN_ID else None))
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("done",  done))
+            app.add_handler(CommandHandler("admin", lambda u, c: show_admin_panel_cmd(u, c)))
 
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.PHOTO,    handle_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+            app.add_handler(CallbackQueryHandler(handle_callbacks))
+            app.add_handler(MessageHandler(filters.PHOTO, receive_image))
+            app.add_handler(MessageHandler(filters.Document.ALL, receive_document))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Bot ishga tushdi...")
-    app.run_polling(drop_pending_updates=True)
+            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+        except Exception as e:
+            logger.error(f"Bot xato: {e}")
+            logger.info("5 soniyadan keyin qayta ishga tushadi...")
+            time.sleep(5)
+
+
+async def show_admin_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Siz admin emassiz!")
+        return
+    db      = load_db()
+    blocked = sum(1 for u in db["users"].values() if u.get("blocked"))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin_users")],
+        [InlineKeyboardButton("📊 Statistika",       callback_data="admin_stats")],
+        [InlineKeyboardButton("📣 Broadcast",        callback_data="admin_broadcast")],
+    ])
+    await update.message.reply_text(
+        f"🛠 <b>Admin Panel</b>\n\n"
+        f"👥 Jami: <b>{len(db['users'])}</b>\n"
+        f"📄 PDF: <b>{db.get('total_pdfs', 0)}</b>\n"
+        f"🚫 Bloklangan: <b>{blocked}</b>",
+        reply_markup=kb, parse_mode="HTML"
+    )
 
 
 if __name__ == "__main__":
