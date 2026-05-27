@@ -431,7 +431,8 @@ async def do_referat(update: Update, context: ContextTypes.DEFAULT_TYPE, mavzu: 
 #  VIDEO / RASM YUKLAB OLISH
 # ═══════════════════════════════════════════════════════════════
 RAPIDAPI_KEY  = os.environ.get("RAPIDAPI_KEY", "")
-RAPIDAPI_HOST = "auto-download-all-in-one.p.rapidapi.com"
+RAPIDAPI_HOST = "social-download-all-in-one.p.rapidapi.com"
+RAPIDAPI_URL  = "https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink"
 
 def is_yt_or_ig(url):
     return bool(re.match(
@@ -440,10 +441,9 @@ def is_yt_or_ig(url):
     ))
 
 async def fetch_download_url(url: str) -> dict:
-    """Auto Download All In One API orqali media URL olish."""
     payload = json.dumps({"url": url}).encode()
     req = urllib.request.Request(
-        "https://auto-download-all-in-one.p.rapidapi.com/v1/social/autolink",
+        RAPIDAPI_URL,
         data=payload,
         headers={
             "Content-Type":    "application/json",
@@ -475,45 +475,46 @@ async def do_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
     msg = await update.message.reply_text("⏳ Yuklanmoqda... 15–30 soniya kutib turing.")
     try:
         data = await fetch_download_url(url)
-        logger.info(f"API response: {str(data)[:300]}")
+        logger.info(f"API response keys: {list(data.keys()) if isinstance(data,dict) else type(data)}")
 
-        # API javobidan media URL larni topish
-        medias   = data.get("medias") or data.get("media") or []
-        title    = (data.get("title") or data.get("caption") or "video")[:50]
+        medias   = data.get("medias") or data.get("media") or data.get("links") or []
+        title    = (data.get("title") or data.get("caption") or
+                    data.get("name") or "video")[:50]
         dl_url   = None
         is_photo = False
 
         if isinstance(medias, list) and medias:
-            # Video formatlardan eng yaxshisini tanlash (720p yoki birinchi)
-            video_items = [m for m in medias if m.get("type","") in ("video","mp4","")]
-            photo_items = [m for m in medias if m.get("type","") in ("photo","image","jpg","png")]
+            # Video formatlardan eng yaxshisini tanlash
+            for preferred_q in ["720", "480", "360", "240", "hd", "sd"]:
+                for m in medias:
+                    if not isinstance(m, dict): continue
+                    q   = str(m.get("quality","") or m.get("resolution","") or m.get("name","")).lower()
+                    ext = str(m.get("extension","") or m.get("type","") or m.get("ext","")).lower()
+                    u   = m.get("url") or m.get("downloadUrl") or m.get("download_url") or m.get("link","")
+                    if not u: continue
+                    if "image" in ext or "photo" in ext or "jpg" in ext or "png" in ext:
+                        continue  # Avval video qidiramiz
+                    if preferred_q in q or preferred_q in ext:
+                        dl_url = u; break
+                if dl_url: break
 
-            if video_items:
-                # quality bo'yicha saralash: 720 > 480 > 360 > boshqa
-                for q in ["720","480","360","240"]:
-                    for m in video_items:
-                        if q in str(m.get("quality","") or m.get("resolution","")):
-                            dl_url = m.get("url") or m.get("downloadUrl") or m.get("download_url")
-                            if dl_url: break
-                    if dl_url: break
-                if not dl_url:
-                    dl_url = (video_items[0].get("url") or
-                              video_items[0].get("downloadUrl") or
-                              video_items[0].get("download_url"))
-            elif photo_items:
-                dl_url   = (photo_items[0].get("url") or
-                            photo_items[0].get("downloadUrl"))
-                is_photo = True
-            else:
-                # type farq qilmasa — birinchisini ol
-                first  = medias[0]
-                dl_url = (first.get("url") or first.get("downloadUrl") or
-                          first.get("download_url"))
-                is_photo = "image" in str(first.get("type","")) or \
-                           "photo" in str(first.get("type",""))
+            # Video topilmasa — birinchi elementni ol
+            if not dl_url:
+                for m in medias:
+                    if not isinstance(m, dict): continue
+                    u   = m.get("url") or m.get("downloadUrl") or m.get("download_url") or m.get("link","")
+                    ext = str(m.get("extension","") or m.get("type","")).lower()
+                    if u:
+                        dl_url   = u
+                        is_photo = any(x in ext for x in ["image","photo","jpg","png","webp"])
+                        break
 
-        elif isinstance(data.get("url"), str):
-            dl_url = data["url"]
+        # medias bo'lmasa to'g'ridan-to'g'ri url/video_url ni tekshir
+        if not dl_url:
+            dl_url = (data.get("url") or data.get("video_url") or
+                      data.get("download_url") or data.get("downloadUrl",""))
+            if dl_url:
+                is_photo = any(x in str(dl_url).lower() for x in [".jpg",".png",".webp"])
 
         if not dl_url:
             await msg.edit_text(
