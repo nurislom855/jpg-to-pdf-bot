@@ -32,8 +32,9 @@ def kb_main():
     return ReplyKeyboardMarkup([
         [KeyboardButton("📸 JPG → PDF"),            KeyboardButton("📄 Word → PDF")],
         [KeyboardButton("📊 PPTX → PDF"),           KeyboardButton("🔗 PDF Birlashtirish")],
-        [KeyboardButton("✍️ Referat yozish"),       KeyboardButton("🎮 O'yin")],
-        [KeyboardButton("👨‍💻 Dasturchi haqida"),   KeyboardButton("💬 Admin bilan bog'lanish")],
+        [KeyboardButton("✍️ Referat yozish"),       KeyboardButton("⬇️ Video/Rasm yuklab olish")],
+        [KeyboardButton("🎮 O'yin"),                KeyboardButton("👨‍💻 Dasturchi haqida")],
+        [KeyboardButton("💬 Admin bilan bog'lanish")],
     ], resize_keyboard=True, input_field_placeholder="Xizmatni tanlang...")
 
 def kb_admin():
