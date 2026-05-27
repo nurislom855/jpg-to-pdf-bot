@@ -202,7 +202,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "🐍 Snake o'yinini ochish",
-                web_app=WebAppInfo(url="https://nurislom855.github.io/jpg-to-pdf-bot/game.html")
+                web_app=WebAppInfo(url="https://nurislom855.github.io/jpg-to-pdf-bot/")
             )
         ]])
         await update.message.reply_text(
