@@ -430,8 +430,29 @@ async def do_referat(update: Update, context: ContextTypes.DEFAULT_TYPE, mavzu: 
 # ═══════════════════════════════════════════════════════════════
 #  VIDEO / RASM YUKLAB OLISH
 # ═══════════════════════════════════════════════════════════════
+RAPIDAPI_KEY  = os.environ.get("RAPIDAPI_KEY", "")
+RAPIDAPI_HOST = "auto-download-all-in-one.p.rapidapi.com"
+
 def is_yt_or_ig(url):
-    return bool(re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|instagram\.com|instagr\.am)', url.strip()))
+    return bool(re.match(
+        r'https?://(www\.)?(youtube\.com|youtu\.be|instagram\.com|instagr\.am)',
+        url.strip()
+    ))
+
+async def fetch_download_url(url: str) -> dict:
+    """Auto Download All In One API orqali media URL olish."""
+    payload = json.dumps({"url": url}).encode()
+    req = urllib.request.Request(
+        "https://auto-download-all-in-one.p.rapidapi.com/v1/social/autolink",
+        data=payload,
+        headers={
+            "Content-Type":    "application/json",
+            "x-rapidapi-host": RAPIDAPI_HOST,
+            "x-rapidapi-key":  RAPIDAPI_KEY,
+        }
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
 
 async def do_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     url = url.strip()
@@ -439,57 +460,115 @@ async def do_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
         await update.message.reply_text(
             "❌ Faqat YouTube yoki Instagram havolasi yuboring!\n\n"
             "▶️ <code>https://youtube.com/watch?v=...</code>\n"
-            "📸 <code>https://instagram.com/p/...</code>", parse_mode="HTML"); return
-    msg = await update.message.reply_text("⏳ Yuklanmoqda... 30–60 soniya kutib turing.")
+            "📸 <code>https://instagram.com/p/...</code>",
+            parse_mode="HTML"
+        ); return
+
+    if not RAPIDAPI_KEY:
+        await update.message.reply_text(
+            "❌ <b>RAPIDAPI_KEY</b> sozlanmagan!\n\n"
+            "GitHub Secrets ga qo'shing:\n"
+            "<code>RAPIDAPI_KEY = a652259c4emsh75ad5e...</code>",
+            parse_mode="HTML"
+        ); return
+
+    msg = await update.message.reply_text("⏳ Yuklanmoqda... 15–30 soniya kutib turing.")
     try:
-        import yt_dlp
-        with tempfile.TemporaryDirectory() as tmp:
-            is_ig = "instagram" in url
-            opts = {
-                "outtmpl":              os.path.join(tmp, "%(title).50s.%(ext)s"),
-                "quiet":                True,
-                "no_warnings":          True,
-                "max_filesize":         50 * 1024 * 1024,
-                "format":               "best[filesize<50M]/best" if is_ig
-                                        else "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-                "merge_output_format":  "mp4",
-            }
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info  = ydl.extract_info(url, download=True)
-                title = (info.get("title") or "media")[:50]
+        data = await fetch_download_url(url)
+        logger.info(f"API response: {str(data)[:300]}")
 
-            files = sorted(Path(tmp).iterdir(), key=lambda x: x.stat().st_size, reverse=True)
-            if not files: raise FileNotFoundError("Fayl topilmadi")
-            fpath = files[0]
-            if fpath.stat().st_size > 50 * 1024 * 1024:
-                await msg.edit_text("❌ Fayl 50 MB dan katta. Telegram limiti."); return
+        # API javobidan media URL larni topish
+        medias   = data.get("medias") or data.get("media") or []
+        title    = (data.get("title") or data.get("caption") or "video")[:50]
+        dl_url   = None
+        is_photo = False
 
-            await msg.edit_text(f"📤 Yuborilmoqda: <b>{title}</b>...", parse_mode="HTML")
-            data = fpath.read_bytes()
-            ext  = fpath.suffix.lower()
+        if isinstance(medias, list) and medias:
+            # Video formatlardan eng yaxshisini tanlash (720p yoki birinchi)
+            video_items = [m for m in medias if m.get("type","") in ("video","mp4","")]
+            photo_items = [m for m in medias if m.get("type","") in ("photo","image","jpg","png")]
 
-            me = (await context.bot.get_me()).username
-            if ext in (".mp4", ".mov", ".avi", ".webm", ".mkv"):
-                await update.message.reply_video(
-                    InputFile(BytesIO(data), filename=fpath.name),
-                    caption=f"🎬 <b>{title}</b>\n📥 @{me}", parse_mode="HTML", supports_streaming=True)
-            elif ext in (".jpg", ".jpeg", ".png", ".webp"):
-                await update.message.reply_photo(
-                    InputFile(BytesIO(data), filename=fpath.name),
-                    caption=f"🖼 <b>{title}</b>\n📥 @{me}", parse_mode="HTML")
+            if video_items:
+                # quality bo'yicha saralash: 720 > 480 > 360 > boshqa
+                for q in ["720","480","360","240"]:
+                    for m in video_items:
+                        if q in str(m.get("quality","") or m.get("resolution","")):
+                            dl_url = m.get("url") or m.get("downloadUrl") or m.get("download_url")
+                            if dl_url: break
+                    if dl_url: break
+                if not dl_url:
+                    dl_url = (video_items[0].get("url") or
+                              video_items[0].get("downloadUrl") or
+                              video_items[0].get("download_url"))
+            elif photo_items:
+                dl_url   = (photo_items[0].get("url") or
+                            photo_items[0].get("downloadUrl"))
+                is_photo = True
             else:
-                await update.message.reply_document(
-                    InputFile(BytesIO(data), filename=fpath.name),
-                    caption=f"📁 <b>{title}</b>", parse_mode="HTML")
-            await msg.delete(); inc_req()
+                # type farq qilmasa — birinchisini ol
+                first  = medias[0]
+                dl_url = (first.get("url") or first.get("downloadUrl") or
+                          first.get("download_url"))
+                is_photo = "image" in str(first.get("type","")) or \
+                           "photo" in str(first.get("type",""))
+
+        elif isinstance(data.get("url"), str):
+            dl_url = data["url"]
+
+        if not dl_url:
+            await msg.edit_text(
+                "❌ Media URL topilmadi.\n"
+                "Video yopiq yoki mavjud emas bo'lishi mumkin."
+            ); return
+
+        # Faylni yuklab olish
+        await msg.edit_text("📥 Fayl yuklanmoqda...")
+        req2 = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req2, timeout=60) as r:
+            file_data = r.read()
+
+        size_mb = len(file_data) / (1024 * 1024)
+        if size_mb > 50:
+            await msg.edit_text(
+                f"❌ Fayl hajmi {size_mb:.1f} MB — Telegram 50 MB limit."
+            ); return
+
+        me      = (await context.bot.get_me()).username
+        caption = f"{'🖼' if is_photo else '🎬'} <b>{title}</b>\n📥 @{me}"
+
+        await msg.edit_text("📤 Yuborilmoqda...")
+        if is_photo:
+            await update.message.reply_photo(
+                InputFile(BytesIO(file_data), filename="photo.jpg"),
+                caption=caption, parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_video(
+                InputFile(BytesIO(file_data), filename="video.mp4"),
+                caption=caption, parse_mode="HTML",
+                supports_streaming=True
+            )
+        await msg.delete()
+        inc_req()
+
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode()[:100]
+        except: pass
+        if e.code == 401:
+            await msg.edit_text("❌ API key noto'g'ri. RAPIDAPI_KEY ni tekshiring.")
+        elif e.code == 403:
+            await msg.edit_text("❌ API ga ruxsat yo'q. Subscribe qildingizmi?")
+        elif e.code == 429:
+            await msg.edit_text("❌ API limit tugadi (500 req/oy).")
+        else:
+            await msg.edit_text(f"❌ API xatosi {e.code}: {body}")
     except Exception as e:
         err = str(e)
-        if "Private" in err or "login" in err.lower():
+        if "private" in err.lower():
             await msg.edit_text("❌ Bu post yopiq (private). Faqat ochiq havolalar ishlaydi.")
-        elif "not available" in err.lower():
-            await msg.edit_text("❌ Bu kontent mavjud emas yoki o'chirilgan.")
         else:
-            await msg.edit_text(f"❌ Yuklab bo'lmadi: {err[:200]}")
+            await msg.edit_text(f"❌ Xatolik: {err[:200]}")
     finally:
         context.user_data.clear()
         await update.message.reply_text("Boshqa xizmat:", reply_markup=kb_main())
