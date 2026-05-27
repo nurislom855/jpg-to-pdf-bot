@@ -49,9 +49,9 @@ def main_reply_keyboard():
     """Foydalanuvchi uchun quyi tugmalar paneli"""
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📸 JPG → PDF"),    KeyboardButton("📄 Word → PDF")],
-            [KeyboardButton("📊 PPTX → PDF"),   KeyboardButton("🔗 PDF Birlashtirish")],
-            [KeyboardButton("📅 Dars jadvali"), KeyboardButton("💬 Admin")],
+            [KeyboardButton("📸 JPG → PDF"),      KeyboardButton("📄 Word → PDF")],
+            [KeyboardButton("📊 PPTX → PDF"),     KeyboardButton("🔗 PDF Birlashtirish")],
+            [KeyboardButton("✍️ Referat yozish"), KeyboardButton("💬 Admin")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Xizmatni tanlang..."
@@ -274,13 +274,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text == "📅 Dars jadvali":
+    if text == "✍️ Referat yozish":
         if not await require_sub(update, context): return
-        context.user_data["mode"] = "timetable_search"
+        context.user_data["mode"] = "referat"
         await update.message.reply_text(
-            "📅 <b>Dars jadvali</b>\n\n"
-            "Guruh nomining bir qismini kiriting:\n"
-            "Masalan: <code>II-52</code> yoki <code>52/24</code> yoki <code>IB-11</code>",
+            "✍️ <b>Referat yozish</b>\n\n"
+            "Referat mavzusini yozing:\n"
+            "Masalan: <code>Ikkinchi jahon urushi sabablari</code>\n\n"
+            "Qo'shimcha ko'rsatmalar bersangiz yanada yaxshi natija beradi.\n"
+            "Masalan: <code>O'zbek tilida, 5 sahifa, kirish-asosiy qism-xulosa</code>",
             parse_mode="HTML"
         )
         return
@@ -294,12 +296,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── MODE ga qarab keyingi harakatlar ──────────────────────
 
-    if mode == "timetable_search":
-        await timetable_search_groups(update, context, text)
-        return
-
-    if mode == "timetable":
-        await fetch_timetable(update, context, text)
+    if mode == "referat":
+        await generate_referat(update, context, text)
         return
 
     if mode == "feedback":
@@ -583,252 +581,104 @@ async def do_merge_pdfs(update, context):
         await wait.edit_text(f"❌ Xato: {str(e)[:200]}")
 
 
-# ==================== TIMETABLE ====================
+# ==================== REFERAT ====================
 
-async def timetable_search_groups(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    """
-    1-qadam: Playwright orqali barcha guruhlar ro'yxatini olish,
-    so'rovga mos keladiganlarini inline tugmalar sifatida ko'rsatish.
-    """
+async def generate_referat(update: Update, context: ContextTypes.DEFAULT_TYPE, mavzu: str):
+    """Claude AI orqali referat yozish."""
     msg = await update.message.reply_text(
-        f"🔍 <b>{query}</b> bo'yicha guruhlar qidirilmoqda...", parse_mode="HTML"
+        f"✍️ <b>«{mavzu}»</b>\n\nReferat yozilmoqda... ⏳\n"
+        "Bu 30-60 soniya olishi mumkin.",
+        parse_mode="HTML"
     )
     try:
-        all_groups = await get_all_groups_playwright()
-        if not all_groups:
-            await msg.edit_text(
-                "❌ Guruhlar ro'yxatini yuklab bo'lmadi. Keyinroq urinib ko'ring."
-            )
-            return
+        import urllib.request, json as _json
 
-        # Qidiruvga mos guruhlarni filter qilish
-        q = query.strip().lower().replace(" ", "")
-        matched = [g for g in all_groups if q in g["name"].lower().replace(" ", "")]
-
-        if not matched:
-            await msg.edit_text(
-                f"❌ <b>{query}</b> bo'yicha guruh topilmadi.\n\n"
-                f"Mavjud guruhlar soni: {len(all_groups)}\n"
-                f"Boshqa kalit so'z kiriting (masalan: <code>52</code> yoki <code>IB</code>)",
-                parse_mode="HTML"
-            )
-            return
-
-        # Inline tugmalar (max 30 ta)
-        buttons = []
-        for g in matched[:30]:
-            buttons.append([InlineKeyboardButton(
-                g["name"], callback_data=f"tt_select_{g['id']}__{g['name']}"
-            )])
-        buttons.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="tt_cancel")])
-
-        await msg.edit_text(
-            f"📋 <b>{len(matched)} ta guruh topildi.</b>\nKerakli guruhni tanlang:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(buttons)
+        prompt = (
+            f"Quyidagi mavzuda o'zbek tilida to'liq akademik referat yoz:\n\n"
+            f"Mavzu: {mavzu}\n\n"
+            f"Referat quyidagi tuzilmada bo'lsin:\n"
+            f"1. Kirish (mavzuning dolzarbligi, maqsad va vazifalar)\n"
+            f"2. Asosiy qism (2-3 bo'lim, har biri 300-400 so'z)\n"
+            f"3. Xulosa\n"
+            f"4. Foydalanilgan adabiyotlar ro'yxati\n\n"
+            f"Referat ilmiy uslubda, aniq, to'liq va professional bo'lsin. "
+            f"Jami hajmi 1000-1500 so'z bo'lsin."
         )
-        context.user_data["mode"] = ""
 
-    except Exception as e:
-        await msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4000,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode("utf-8")
 
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": os.environ.get("ANTHROPIC_API_KEY", "")
+            }
+        )
 
-async def get_all_groups_playwright() -> list[dict]:
-    """Playwright orqali TSUE saytidan barcha guruhlar ro'yxatini olish."""
-    import json as _json
+        with urllib.request.urlopen(req, timeout=120) as r:
+            resp     = _json.loads(r.read().decode("utf-8"))
+            referat  = resp["content"][0]["text"]
 
-    script_path = "/tmp/tsue_get_groups.py"
-    script_code = (
-        "import asyncio, sys, json, re\n"
-        "from playwright.async_api import async_playwright\n"
-        "\n"
-        "JS_EVAL = '''\n"
-        "() => {\n"
-        "  try {\n"
-        "    const keys = Object.keys(window);\n"
-        "    for (const k of keys) {\n"
-        "      const v = window[k];\n"
-        "      if (v && typeof v === 'object' && Array.isArray(v.classes) && v.classes.length > 5)\n"
-        "        return v.classes.map(c => ({id: String(c.id), name: c.name}));\n"
-        "      if (v && typeof v === 'object' && v.ttdata && Array.isArray(v.ttdata.classes))\n"
-        "        return v.ttdata.classes.map(c => ({id: String(c.id), name: c.name}));\n"
-        "    }\n"
-        "    const selects = document.querySelectorAll('select');\n"
-        "    for (const sel of selects) {\n"
-        "      const opts = Array.from(sel.options)\n"
-        "        .filter(o => o.value && o.text)\n"
-        "        .map(o => ({id: o.value, name: o.text.trim()}));\n"
-        "      if (opts.length > 20) return opts;\n"
-        "    }\n"
-        "  } catch(e) {}\n"
-        "  return [];\n"
-        "}\n"
-        "'''\n"
-        "\n"
-        "async def main():\n"
-        "    async with async_playwright() as p:\n"
-        "        browser = await p.chromium.launch(args=[\n"
-        "            '--no-sandbox','--disable-setuid-sandbox',\n"
-        "            '--disable-dev-shm-usage','--disable-gpu'\n"
-        "        ])\n"
-        "        page = await browser.new_page(viewport={'width':1400,'height':900})\n"
-        "        await page.goto('https://tsue.edupage.org/timetable/',\n"
-        "                        wait_until='networkidle', timeout=30000)\n"
-        "        groups = await page.evaluate(JS_EVAL)\n"
-        "        if not groups:\n"
-        "            html = await page.content()\n"
-        "            items = re.findall(\n"
-        "                r'\\\"id\\\"\\s*:\\s*\\\"?(\\d+)\\\"?[^}]*\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"',\n"
-        "                html\n"
-        "            )\n"
-        "            groups = [{'id': i, 'name': n} for i, n in items if '/' in n or '-' in n]\n"
-        "        await browser.close()\n"
-        "        print(json.dumps(groups, ensure_ascii=False))\n"
-        "\n"
-        "asyncio.run(main())\n"
-    )
+        await msg.delete()
 
-    with open(script_path, "w") as f:
-        f.write(script_code)
+        # Referat uzun bo'lsa bo'lib yuborish (Telegram 4096 char limit)
+        chunks = [referat[i:i+4000] for i in range(0, len(referat), 4000)]
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                await update.message.reply_text(
+                    f"📄 <b>«{mavzu}»</b>\n\n{chunk}",
+                    parse_mode="HTML"
+                )
+            else:
+                await update.message.reply_text(chunk, parse_mode="HTML")
 
-    proc = await asyncio.create_subprocess_exec(
-        "python3", script_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=50)
-        if proc.returncode == 0 and stdout.strip():
-            data = _json.loads(stdout.decode("utf-8").strip())
-            return data if isinstance(data, list) else []
-        else:
-            logger.error(f"get_all_groups stderr: {stderr.decode()[:300]}")
-    except Exception as e:
-        logger.error(f"get_all_groups error: {e}")
-    return []
+        # Word fayl sifatida ham yuborish
+        try:
+            import subprocess, tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                txt_path = os.path.join(tmp, "referat.txt")
+                doc_path = os.path.join(tmp, "referat.docx")
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(f"MAVZU: {mavzu}\n\n{referat}")
+                # LibreOffice bilan docx ga
+                subprocess.run(
+                    ["libreoffice", "--headless", "--convert-to", "docx",
+                     "--outdir", tmp, txt_path],
+                    capture_output=True, timeout=30
+                )
+                if os.path.exists(doc_path):
+                    with open(doc_path, "rb") as f:
+                        safe_name = mavzu[:30].replace("/", "-").replace("\\", "-") + ".docx"
+                        await update.message.reply_document(
+                            document=InputFile(f, filename=safe_name),
+                            caption="📎 Referat Word formatida"
+                        )
+        except Exception:
+            pass  # Word fayl ishlamasa ham matn yuborilgan
 
+        _inc_requests()
 
-async def fetch_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE, group: str):
-    """Guruh nomi bilan to'g'ridan-to'g'ri screenshot olish (fallback)."""
-    msg = await update.message.reply_text(
-        f"⏳ <b>{group}</b> dars jadvali yuklanmoqda...", parse_mode="HTML"
-    )
-    try:
-        screenshot = await capture_timetable_by_name(group)
-        if screenshot and len(screenshot) > 3000:
-            await update.message.reply_photo(
-                photo=InputFile(BytesIO(screenshot), filename="timetable.png"),
-                caption=f"📅 <b>{group}</b> — Dars jadvali\n🏫 TSUE", parse_mode="HTML"
-            )
-            await msg.delete()
-        else:
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        if "invalid x-api-key" in body or e.code == 401:
             await msg.edit_text(
-                f"❌ <b>{group}</b> guruhi jadvalini yuklab bo'lmadi.",
+                "❌ ANTHROPIC_API_KEY sozlanmagan.\n"
+                "GitHub Secrets ga <code>ANTHROPIC_API_KEY</code> qo'shing.",
                 parse_mode="HTML"
             )
+        else:
+            await msg.edit_text(f"❌ AI xatoligi: {e.code} — {body[:200]}")
     except Exception as e:
         await msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
     finally:
         context.user_data.clear()
         await update.message.reply_text("Boshqa xizmat:", reply_markup=main_reply_keyboard())
-
-
-async def capture_timetable_by_id(group_id: str, group_name: str) -> bytes | None:
-    """EduPage group ID orqali jadval sahifasini screenshot qilish."""
-    # EduPage direct URL pattern: ?class=ID
-    script = f"""
-import asyncio, sys
-from playwright.async_api import async_playwright
-
-async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(args=[
-            "--no-sandbox","--disable-setuid-sandbox",
-            "--disable-dev-shm-usage","--disable-gpu"
-        ])
-        page = await browser.new_page(viewport={{"width":1400,"height":900}})
-
-        # To'g'ridan-to'g'ri URL orqali ochish
-        urls_to_try = [
-            "https://tsue.edupage.org/timetable/?class={group_id}",
-            "https://tsue.edupage.org/timetable/#class,{group_id}",
-            "https://tsue.edupage.org/timetable/?type=class&id={group_id}",
-        ]
-
-        success = False
-        for url in urls_to_try:
-            try:
-                await page.goto(url, wait_until="networkidle", timeout=25000)
-                await asyncio.sleep(2)
-                # Jadval bor-yo'qligini tekshir
-                els = await page.query_selector_all(".printTimetable, .timetable, table.table-bordered")
-                if els:
-                    success = True
-                    break
-            except Exception:
-                continue
-
-        if not success:
-            # Qidiruv orqali topishga urinish
-            await page.goto("https://tsue.edupage.org/timetable/", wait_until="networkidle", timeout=25000)
-            await asyncio.sleep(1)
-            for sel in ["input[type='text']", ".searchField input", "input.form-control"]:
-                try:
-                    el = await page.wait_for_selector(sel, timeout=4000)
-                    await el.fill("{group_name}")
-                    await asyncio.sleep(1.5)
-                    # Dropdown tanlab olish
-                    for item_sel in [
-                        "li.ui-menu-item", ".autocomplete-suggestion",
-                        ".ui-autocomplete li", ".dropdown-item", "ul li a"
-                    ]:
-                        items = await page.query_selector_all(item_sel)
-                        for item in items:
-                            t = (await item.inner_text()).strip()
-                            if "{group_name}".lower() in t.lower():
-                                await item.click()
-                                await asyncio.sleep(2)
-                                break
-                    break
-                except Exception:
-                    continue
-            await asyncio.sleep(2)
-
-        # Jadval qismini screenshot
-        for tbl_sel in [".printTimetable", "#timetable", ".timetable", "div.card", "table"]:
-            el = await page.query_selector(tbl_sel)
-            if el:
-                try:
-                    shot = await el.screenshot(type="png")
-                    sys.stdout.buffer.write(shot)
-                    await browser.close()
-                    return
-                except Exception:
-                    continue
-
-        # To'liq sahifa
-        shot = await page.screenshot(full_page=False, type="png")
-        sys.stdout.buffer.write(shot)
-        await browser.close()
-
-asyncio.run(main())
-"""
-    proc = await asyncio.create_subprocess_exec(
-        "python3", "-c", script,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return None
-    return stdout if (proc.returncode == 0 and len(stdout) > 3000) else None
-
-
-async def capture_timetable_by_name(group_name: str) -> bytes | None:
-    """Guruh nomi orqali jadval screenshot (fallback)."""
-    return await capture_timetable_by_id("", group_name)
-
 
 
 # ==================== /done ====================
@@ -940,46 +790,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mode"] = "waiting_word_name"
         await q.edit_message_text("✏️ Yangi fayl nomini yozing:")
         return
-
-    # Timetable group select
-    if data == "tt_cancel":
-        await q.edit_message_text("❌ Bekor qilindi.")
-        await context.bot.send_message(q.from_user.id, "Xizmatni tanlang:", reply_markup=main_reply_keyboard())
-        return
-
-    if data.startswith("tt_select_"):
-        # format: tt_select_{id}__{name}
-        parts = data[len("tt_select_"):].split("__", 1)
-        group_id   = parts[0]
-        group_name = parts[1] if len(parts) > 1 else group_id
-        await q.edit_message_text(
-            f"⏳ <b>{group_name}</b> dars jadvali yuklanmoqda...\n"
-            "Bu 20-40 soniya olishi mumkin ⏱", parse_mode="HTML"
-        )
-        try:
-            screenshot = await capture_timetable_by_id(group_id, group_name)
-            if screenshot and len(screenshot) > 3000:
-                await context.bot.send_photo(
-                    chat_id=q.message.chat_id,
-                    photo=InputFile(BytesIO(screenshot), filename="timetable.png"),
-                    caption=f"📅 <b>{group_name}</b> — Dars jadvali\n🏫 TSUE",
-                    parse_mode="HTML"
-                )
-                await q.message.delete()
-            else:
-                await q.edit_message_text(
-                    f"❌ <b>{group_name}</b> jadvalini yuklab bo'lmadi.\n"
-                    "Sayt vaqtincha ishlamayapti yoki guruh jadvali mavjud emas.",
-                    parse_mode="HTML"
-                )
-        except Exception as e:
-            await q.edit_message_text(f"❌ Xatolik: {str(e)[:200]}")
-        finally:
-            await context.bot.send_message(
-                q.message.chat_id, "Boshqa xizmat:", reply_markup=main_reply_keyboard()
-            )
-        return
-
 
     if user.id != ADMIN_ID:
         return
